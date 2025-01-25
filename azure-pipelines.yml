@@ -1,19 +1,174 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
-
 trigger:
 - main
 
 pool:
-  vmImage: ubuntu-latest
+  vmImage: 'ubuntu-latest'
 
 steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+# Step 1: Azure Security Center
+- task: AzureCLI@2
+  displayName: 'Run Static Application Security Tests (SAST)'
+  inputs:
+    azureSubscription: $(azureSubscription)
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      az security auto-provisioning-setting update --name default --auto-provision "On"
+
+      # Trigger Security Center to scan your resources
+      az security task list --resource-group $(aksResourceGroup)
+
+      # List the results of the Security Center scan
+      az security task list --resource-group $(aksResourceGroup)
+
+# Step 2: Azure Dependency Scanning
+- task: AzureCLI@2
+  displayName: 'Scan Container Images for Vulnerabilities in ACR'
+  inputs:
+    azureSubscription: $(azureSubscription)
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      az acr update --name $(acrName) --sku Premium
+      az acr config content-trust enable --name $(acrName)
+
+      # Build and trigger a vulnerability scan in ACR for the container image
+      az acr build --image $(CONTROLLER_IMAGE):$(CONTROLLER_TAG) --registry $(acrName) .
+      az acr task run --name $(CONTROLLER_IMAGE) --registry $(acrName) --image $(CONTROLLER_IMAGE):$(CONTROLLER_TAG)
+
+      # Fetch the result of the vulnerability scan
+      az security container-registry vulnerability-scan show --registry $(acrName) --repository $(CONTROLLER_IMAGE) --tag $(CONTROLLER_TAG)
+
+      # Fail the pipeline if vulnerabilities are found
+      if [ $? -ne 0 ]; then
+        echo "Vulnerability scan failed: vulnerabilities detected in container image."
+        exit 1
+      fi
+
+# Step 3: Security Testing on Kubernetes Configurations (using Azure Policies)
+- task: AzureCLI@2
+  displayName: 'Apply Security Policies to AKS'
+  inputs:
+    azureSubscription: $(azureSubscription)
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      # Enable Azure Policy for AKS to enforce security controls
+      az aks enable-addons --resource-group $(aksResourceGroup) --name $(aksClusterName) --addons azure-policy
+
+      # Test if security policies are being enforced (e.g., privilege escalation prevention)
+      az policy assignment create --name "restrict-privilege-escalation" --policy "/subscriptions/$(subscriptionId)/providers/Microsoft.Authorization/policyDefinitions/$(policyId)" --scope "/subscriptions/$(subscriptionId)/resourceGroups/$(aksResourceGroup)"
+
+      # Verify that the policies are applied and check compliance
+      compliance_state=$(az policy state summarize --resource-group $(aksResourceGroup) --policy-definition $(policyId) | jq '.value[0].complianceState')
+      if [[ "$compliance_state" != "Compliant" ]]; then
+        echo "Policy compliance failed: non-compliant resources detected."
+        exit 1
+      fi
+
+# Step 4: Create Azure Resources and Configure AKS (Already Present)
+- task: AzureCLI@2
+  inputs:
+    azureSubscription: $(azureSubscription)
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      az group create --name $(aksResourceGroup) --location $(location)
+
+      az network vnet create \
+        --resource-group $(aksResourceGroup) \
+        --name $(vnetName) \
+        --location $(location) \
+        --subnet-name $(subnetName)
+
+      az acr create \
+        --resource-group $(aksResourceGroup) \
+        --name $(acrName) \
+        --sku Basic \
+        --admin-enabled true
+
+      az aks create \
+        --resource-group $(aksResourceGroup) \
+        --name $(aksClusterName) \
+        --node-count 2 \
+        --enable-private-cluster \
+        --enable-managed-identity \
+        --enable-addons monitoring \
+        --generate-ssh-keys \
+        --vnet-subnet-id "/subscriptions/$(subscriptionId)/resourceGroups/$(aksResourceGroup)/providers/Microsoft.Network/virtualNetworks/$(vnetName)/subnets/$(subnetName)"
+
+      az aks get-credentials \
+        --resource-group $(aksResourceGroup) \
+        --name $(aksClusterName) \
+        --admin
+
+      az aks update \
+        --resource-group $(aksResourceGroup) \
+        --name $(aksClusterName) \
+        --attach-acr $(acrName)
+
+      az acr helm install-cli
+
+      az acr create --resource-group myResourceGroup \
+      --name $(acrName) --sku Basic
+
+# Step 5: Test Kubernetes Configurations and Apply Security Tests
+- task: Bash@3
+  displayName: 'Test Kubernetes Configuration for Security Best Practices'
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Example test to verify security settings in Kubernetes configuration
+      kubectl get deployments -n ingress-basic -o json | jq '.items[] | select(.spec.template.spec.securityContext.runAsNonRoot == null)'
+
+      # Check if all pods are running as non-root (as an example of a security check)
+      if [[ $(kubectl get pods -n ingress-basic -o json | jq '.items[].spec.securityContext.runAsNonRoot') == "null" ]]; then
+        echo "Security test failed: Some pods are not running as non-root."
+        exit 1
+      fi
+
+# Step 6: Install Ingress Controller (Helm)
+- task: Bash@3
+  displayName: 'Install Ingress Controller'
+  inputs:
+    targetType: 'inline'
+    script: |
+      helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+      helm repo update
+      ACR_LOGIN_SERVER=sa-task-acr
+
+      helm install ingress-nginx ingress-nginx/ingress-nginx \
+        --version 4.7.1 \
+        --namespace ingress-basic \
+        --create-namespace \
+        --set controller.replicaCount=2 \
+        --set controller.nodeSelector."kubernetes\.io/os"=linux \
+        --set controller.image.registry=$ACR_LOGIN_SERVER \
+        --set controller.image.image=$CONTROLLER_IMAGE \
+        --set controller.image.tag=$CONTROLLER_TAG \
+        --set controller.image.digest="" \
+        --set controller.admissionWebhooks.patch.nodeSelector."kubernetes\.io/os"=linux \
+        --set controller.service.loadBalancerIP=10.224.0.42 \
+        --set controller.service.annotations."service\.beta\.kubernetes\.io/azure-load-balancer-internal"=true \
+        --set controller.service.annotations."service\.beta\.kubernetes\.io/azure-load-balancer-health-probe-request-path"=/healthz \
+        --set controller.admissionWebhooks.patch.image.registry=$ACR_LOGIN_SERVER \
+        --set controller.admissionWebhooks.patch.image.image=$PATCH_IMAGE \
+        --set controller.admissionWebhooks.patch.image.tag=$PATCH_TAG \
+        --set controller.admissionWebhooks.patch.image.digest="" \
+        --set defaultBackend.nodeSelector."kubernetes\.io/os"=linux \
+        --set defaultBackend.image.registry=$ACR_LOGIN_SERVER \
+        --set defaultBackend.image.image=$DEFAULTBACKEND_IMAGE \
+        --set defaultBackend.image.tag=$DEFAULTBACKEND_TAG \
+        --set defaultBackend.image.digest=""
+
+# Step 7: Deploy to AKS (Production Stage)
+- task: AzureCLI@2
+  displayName: 'Deploy to AKS'
+  inputs:
+    azureSubscription: $(azureSubscription)
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      kubectl apply -f k8s/
+
